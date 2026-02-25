@@ -1,17 +1,11 @@
-import { getModel } from "../llm/model"
-import { extractJSON } from "../parsers/json.parser"
+import { executeLLM } from "../core/llm.executer"
 import { intentSchema, IntentOutput } from "../schemas/intent.schema"
-import { withRetry } from "../core/retry"
-
-const model = getModel()
 
 export async function classifyIntent(
   userInput: string
 ): Promise<IntentOutput> {
 
-  return withRetry(async () => {
-
-    const response = await model.invoke(`
+  const prompt = `
 Classify the intent of this message.
 
 Return ONLY valid JSON:
@@ -24,11 +18,10 @@ Return ONLY valid JSON:
 
 Message:
 ${userInput}
-`)
+`
 
-    const parsed = extractJSON(response.content)
-
-    return intentSchema.parse(parsed)
-
-  }, 3)
+  return executeLLM({
+    prompt,
+    schema: intentSchema
+  })
 }
