@@ -26,10 +26,13 @@ export async function executeLLM<T>({
     retryCount++
 
     const response = await model.invoke(prompt)
+    console.log("Raw LLM Response:", response.content)
 
     const parsed = extractJSON(response.content)
+    console.log("Parsed LLM Response:", parsed)
 
     const validated = schema.parse(parsed)
+    console.log("Validated LLM Response:", validated)
 
     const cost = estimateCost(response.totalTokens)
 

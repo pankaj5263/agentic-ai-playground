@@ -8,45 +8,32 @@ const client = new Groq({
 
 export class GroqProvider implements LLMProvider {
 
-  async invoke(prompt: string): Promise<LLMResponse> {
+  async invoke(messages: any[], tools?: any[]): Promise<LLMResponse> {
+
     const start = Date.now()
 
-    const response = await client.chat.completions.create({
-      model: config.model,
-      temperature: config.temperature,
-      max_tokens: config.maxTokens,
-      messages: [
-        { role: "system", content: "You are a precise AI system." },
-        { role: "user", content: prompt }
-      ],
-    })
+  const response = await client.chat.completions.create({
+    model: config.model,
+    temperature: config.temperature,
+    max_tokens: config.maxTokens,
+    messages,
+    tools,
+    tool_choice: tools ? "auto" : undefined
+  })
 
     const latencyMs = Date.now() - start
+    const message = response.choices[0]?.message
+
+    console.log("Groq Response:", message)
 
     return {
-      content: response.choices[0]?.message?.content ?? "",
+      content: message?.content ?? "",
+      toolCalls: message?.tool_calls ?? [],
       tokensIn: response.usage?.prompt_tokens ?? 0,
       tokensOut: response.usage?.completion_tokens ?? 0,
       totalTokens: response.usage?.total_tokens ?? 0,
       latencyMs,
       model: response.model
-    }
-  }
-
-  async *stream(prompt: string): AsyncGenerator<string> {
-    const stream = await client.chat.completions.create({
-      model: config.model,
-      temperature: config.temperature,
-      stream: true,
-      messages: [
-        { role: "system", content: "You are a precise AI system." },
-        { role: "user", content: prompt }
-      ],
-    })
-
-    for await (const chunk of stream) {
-      const content = chunk.choices[0]?.delta?.content
-      if (content) yield content
     }
   }
 }
