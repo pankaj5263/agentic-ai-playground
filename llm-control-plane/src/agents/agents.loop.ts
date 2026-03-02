@@ -1,76 +1,164 @@
-import { getModel } from "../llm/model";
-import { toolRegistry } from "../tools/tool.registry";
-import { getToolDefinitions } from "../tools/tool.registry";
+import { getModel } from "../llm/model"
+import { toolRegistry, getToolDefinitions } from "../tools/tool.registry"
+import { InMemoryStore } from "../memory/inMemory.store"
+import { agentRuntimeConfig } from "../runtime/agent.config"
+import { AgentTracer } from "../observability/tracer"
+import {
+  IterationLimitExceededError,
+  TokenBudgetExceededError,
+  ToolExecutionError
+} from "../errors/agent.errors"
+import { ChatMessage } from "../types/chat.types"
 
-const model = getModel();
+enum AgentState {
+  THINKING,
+  CALLING_TOOL
+}
 
-export async function runAgent(userInput: string) {
-  const toolDefinitions = getToolDefinitions();
+const model = getModel()
+const memory = new InMemoryStore()
 
-  const maxIterations = 5;
-  let iteration = 0;
+export async function runAgent(
+  userInput: string,
+  sessionId: string = "default-session"
+): Promise<string> {
 
-  // Conversation memory
-  const messages: any[] = [
-    {
+  const tracer = new AgentTracer(sessionId)
+
+  let state: AgentState = AgentState.THINKING
+  let iteration = 0
+  let accumulatedTokens = 0
+
+  let messages: ChatMessage[] = memory.getMessages(sessionId)
+
+  // Initialize system message
+  if (messages.length === 0) {
+    messages.push({
       role: "system",
       content: `
-You are an AI agent.
-
-If calculation is required, use the calculator tool.
-Otherwise respond normally.
-
-You may call tools multiple times before giving final answer.
-`,
-    },
-    {
-      role: "user",
-      content: userInput,
-    },
-  ];
-
-  while (iteration < maxIterations) {
-    iteration++;
-
-    const response = await model.invoke(messages, toolDefinitions);
-
-    // 📊 Optional: log metrics here if needed
-    console.log(`Agent Iteration ${iteration}`);
-    console.log("Tool Calls:", response.toolCalls);
-
-    // If tool was called
-    if (response.toolCalls && response.toolCalls.length > 0) {
-      const toolCall = response.toolCalls[0];
-      const toolName = toolCall.function.name;
-      const toolArgs = JSON.parse(toolCall.function.arguments);
-
-      const tool = toolRegistry[toolName];
-
-      if (!tool) {
-        throw new Error(`Unknown tool: ${toolName}`);
-      }
-
-      const result = await tool.execute(toolArgs);
-
-      // Add assistant tool call message
-      messages.push({
-        role: "assistant",
-        tool_calls: response.toolCalls,
-      });
-
-      // Add tool result message
-      messages.push({
-        role: "tool",
-        tool_call_id: toolCall.id,
-        content: JSON.stringify(result),
-      });
-
-      continue;
-    }
-
-    // No tool calls → final answer
-    return response.content;
+You are a state-driven AI agent.
+You may call tools multiple times.
+Only return final answer when complete.
+`
+    })
   }
 
-  throw new Error("Agent exceeded max iterations");
+  // Add user message
+  messages.push({
+    role: "user",
+    content: userInput
+  })
+
+  const toolDefinitions = getToolDefinitions()
+
+  try {
+
+    while (true) {
+
+      // 🔒 Iteration Guard
+      if (iteration >= agentRuntimeConfig.maxIterations) {
+        throw new IterationLimitExceededError("Max iterations exceeded")
+      }
+
+      iteration++
+
+      // ===============================
+      // 🧠 THINKING STATE
+      // ===============================
+      if (state === AgentState.THINKING) {
+
+        const response = await model.invoke(messages, toolDefinitions)
+
+        accumulatedTokens += response.totalTokens
+
+        // 🔒 Token Guard
+        if (accumulatedTokens > agentRuntimeConfig.maxTotalTokens) {
+          throw new TokenBudgetExceededError("Token budget exceeded")
+        }
+
+        tracer.addIteration({
+          iteration,
+          model: response.model,
+          tokensIn: response.tokensIn,
+          tokensOut: response.tokensOut,
+          totalTokens: response.totalTokens,
+          latencyMs: response.latencyMs,
+          toolCalls: response.toolCalls?.map((t: any) => t.function.name)
+        })
+
+        // 🔧 Tool requested
+        if (response.toolCalls && response.toolCalls.length > 0) {
+
+          messages.push({
+            role: "assistant",
+            tool_calls: response.toolCalls
+          })
+
+          state = AgentState.CALLING_TOOL
+          continue
+        }
+
+        // ✅ Final answer
+        messages.push({
+          role: "assistant",
+          content: response.content
+        })
+
+        tracer.finish(response.content)
+        memory.saveMessages(sessionId, messages)
+
+        return response.content
+      }
+
+      // ===============================
+      // 🔧 CALLING TOOL STATE
+      // ===============================
+      if (state === AgentState.CALLING_TOOL) {
+
+        const lastMessage = messages[messages.length - 1]
+
+        if (
+          lastMessage.role !== "assistant" ||
+          !lastMessage.tool_calls
+        ) {
+          throw new Error("Expected assistant tool call message")
+        }
+
+        const results = await Promise.all(
+          lastMessage.tool_calls.map(async (call: any) => {
+
+            const toolName = call.function.name
+            const toolArgs = JSON.parse(call.function.arguments)
+
+            const tool = toolRegistry[toolName]
+            if (!tool) {
+              throw new ToolExecutionError(`Unknown tool: ${toolName}`)
+            }
+
+            const result = await tool.execute(toolArgs)
+
+            return {
+              tool_call_id: call.id,
+              result
+            }
+          })
+        )
+
+        // Append tool results
+        results.forEach(r => {
+          messages.push({
+            role: "tool",
+            tool_call_id: r.tool_call_id,
+            content: JSON.stringify(r.result)
+          })
+        })
+
+        state = AgentState.THINKING
+      }
+    }
+
+  } catch (err: any) {
+    tracer.fail(err.message)
+    throw err
+  }
 }
